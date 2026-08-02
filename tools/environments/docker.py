@@ -113,7 +113,9 @@ def _rewrite_mount_source_for_docker_host(
 
     source = os.path.abspath(os.path.expanduser(path))
     container_root_abs = os.path.abspath(os.path.expanduser(container_root))
-    host_root_abs = os.path.abspath(os.path.expanduser(host_root))
+    # host_root is Docker-daemon-side, may be a foreign OS path (e.g. Windows
+    # Docker Desktop). Passed through verbatim — abspath would mangle it.
+    host_root_abs = host_root
     try:
         if os.path.commonpath([source, container_root_abs]) != container_root_abs:
             return source
@@ -889,6 +891,7 @@ class DockerEnvironment(BaseEnvironment):
         env: dict | None = None,
         network: bool = True,
         host_cwd: str = None,
+        container_root: str = None,
         auto_mount_cwd: bool = False,
         run_as_host_user: bool = False,
         extra_args: list = None,
@@ -968,10 +971,12 @@ class DockerEnvironment(BaseEnvironment):
             else:
                 logger.warning(f"Docker volume '{vol}' missing colon, skipping")
 
-        host_cwd_abs = os.path.abspath(os.path.expanduser(host_cwd)) if host_cwd else ""
+        # Not abspath'd: host_cwd is Docker-daemon-side, may be a foreign OS path.
+        host_cwd_abs = host_cwd or ""
+        # container_root: pre-/workspace-remap container path. Falls back to cwd.
         translate_mount_source = lambda path: _rewrite_mount_source_for_docker_host(
             path,
-            container_root=cwd,
+            container_root=container_root or cwd,
             host_root=host_cwd_abs,
         )
         bind_host_cwd = (

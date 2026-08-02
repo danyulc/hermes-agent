@@ -807,6 +807,7 @@ def _get_or_create_env(task_id: str):
             local_config=local_config,
             task_id=effective_task_id,
             host_cwd=config.get("host_cwd"),
+            container_data_root=config.get("container_data_root"),
         )
 
         with _env_lock:

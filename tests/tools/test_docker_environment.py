@@ -4,6 +4,7 @@ import subprocess
 
 import pytest
 
+import tools.terminal_tool as terminal_tool
 from tools.environments import docker as docker_env
 
 
@@ -167,58 +168,66 @@ def test_auto_mount_replaces_persistent_workspace_bind(monkeypatch, tmp_path):
     assert "/sandboxes/docker/test-persistent-auto-mount/workspace:/workspace" not in run_args_str
 
 
-def test_dood_mounts_rewrite_auto_generated_paths(monkeypatch, tmp_path):
-    """Auto-generated mounts should rewrite container-root paths for DooD."""
+def _patch_dood_mounts(monkeypatch, tmp_path):
+    """Stand in for /opt/data with a writable tmp_path; nest sandbox/credential/
+    skills/cache dirs under it for real (DockerEnvironment stats via pathlib,
+    not os.path, so mocking isfile/isdir doesn't work). Returns container_root
+    plus the credential/skills/cache host_path strings.
+    """
     import tools.credential_files as credential_files
     import tools.environments.base as base_env
 
+    container_root = str(tmp_path)
     sandbox_root = tmp_path / "sandboxes"
     sandbox_root.mkdir()
+
+    credential_file = tmp_path / "google_token.json"
+    credential_file.write_text("{}")
+    skills_dir = tmp_path / "skills"
+    skills_dir.mkdir()
+    cache_dir = tmp_path / "cache" / "screenshots"
+    cache_dir.mkdir(parents=True)
+
+    credential_path = str(credential_file)
+    skills_path = str(skills_dir)
+    cache_path = str(cache_dir)
 
     monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
     monkeypatch.setattr(base_env, "get_sandbox_dir", lambda: sandbox_root)
     monkeypatch.setattr(
         credential_files,
         "get_credential_file_mounts",
-        lambda: [{"host_path": "/opt/data/google_token.json", "container_path": "/root/.hermes/google_token.json"}],
+        lambda: [{"host_path": credential_path, "container_path": "/root/.hermes/google_token.json"}],
     )
     monkeypatch.setattr(
         credential_files,
         "get_skills_directory_mount",
         lambda container_base="/root/.hermes": [
-            {"host_path": "/opt/data/skills", "container_path": f"{container_base}/skills"},
+            {"host_path": skills_path, "container_path": f"{container_base}/skills"},
         ],
     )
     monkeypatch.setattr(
         credential_files,
         "get_cache_directory_mounts",
         lambda container_base="/root/.hermes": [
-            {"host_path": "/opt/data/cache/screenshots", "container_path": f"{container_base}/cache/screenshots"},
+            {"host_path": cache_path, "container_path": f"{container_base}/cache/screenshots"},
         ],
     )
 
-    real_isdir = docker_env.os.path.isdir
+    return container_root, credential_path, skills_path, cache_path
 
-    def _fake_isdir(path):
-        if path in {
-            "/opt/data/skills",
-            "/opt/data/cache/screenshots",
-        }:
-            return True
-        return real_isdir(path)
 
-    def _fake_isfile(path):
-        return path == "/opt/data/google_token.json"
-
-    monkeypatch.setattr(docker_env.os.path, "isdir", _fake_isdir)
-    monkeypatch.setattr(docker_env.os.path, "isfile", _fake_isfile)
+def test_dood_mounts_rewrite_auto_generated_paths(monkeypatch, tmp_path):
+    """Auto-generated mounts should rewrite container-root paths for DooD."""
+    container_root, credential_path, skills_path, cache_path = _patch_dood_mounts(monkeypatch, tmp_path)
+    host_root = "/mnt/user/appdata/hermes-agent/opt/data"
 
     calls = _mock_subprocess_run(monkeypatch)
 
     _make_dummy_env(
-        cwd="/opt/data",
+        cwd=container_root,
         persistent_filesystem=True,
-        host_cwd="/mnt/user/appdata/hermes-agent/opt/data",
+        host_cwd=host_root,
         auto_mount_cwd=True,
         task_id="dood-paths",
     )
@@ -226,12 +235,117 @@ def test_dood_mounts_rewrite_auto_generated_paths(monkeypatch, tmp_path):
     run_calls = [c for c in calls if isinstance(c[0], list) and len(c[0]) >= 2 and c[0][1] == "run"]
     assert run_calls, "docker run should have been called"
     run_args_str = " ".join(run_calls[0][0])
-    assert "/mnt/user/appdata/hermes-agent/opt/data:/workspace" in run_args_str
-    assert "/mnt/user/appdata/hermes-agent/opt/data/sandboxes/docker/dood-paths/home:/root" in run_args_str
-    assert "/mnt/user/appdata/hermes-agent/opt/data/google_token.json:/root/.hermes/google_token.json:ro" in run_args_str
-    assert "/mnt/user/appdata/hermes-agent/opt/data/skills:/root/.hermes/skills:ro" in run_args_str
-    assert "/mnt/user/appdata/hermes-agent/opt/data/cache/screenshots:/root/.hermes/cache/screenshots:ro" in run_args_str
-    assert "/opt/data/sandboxes/docker/dood-paths/home:/root" not in run_args_str
+    assert f"{host_root}:/workspace" in run_args_str
+    assert f"{host_root}/sandboxes/docker/dood-paths/home:/root" in run_args_str
+    assert f"{host_root}/google_token.json:/root/.hermes/google_token.json:ro" in run_args_str
+    assert f"{host_root}/skills:/root/.hermes/skills:ro" in run_args_str
+    assert f"{host_root}/cache/screenshots:/root/.hermes/cache/screenshots:ro" in run_args_str
+    assert f"{container_root}/sandboxes/docker/dood-paths/home:/root" not in run_args_str
+
+
+def test_dood_construction_via_terminal_config_uses_host_data_root(monkeypatch, tmp_path):
+    """DooD rewrite through the real config->environment flow, not direct construction."""
+    container_root, credential_path, skills_path, cache_path = _patch_dood_mounts(monkeypatch, tmp_path)
+    host_root = "/mnt/user/appdata/hermes-agent/opt/data"
+
+    monkeypatch.setenv("TERMINAL_ENV", "docker")
+    monkeypatch.setenv("TERMINAL_CWD", container_root)
+    monkeypatch.setenv("TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE", "true")
+    monkeypatch.setenv("TERMINAL_DOCKER_HOST_DATA_ROOT", host_root)
+    monkeypatch.setenv("TERMINAL_CONTAINER_PERSISTENT", "true")
+
+    config = terminal_tool._get_env_config()
+    assert config["cwd"] == "/workspace"
+    assert config["host_cwd"] == host_root
+    assert config["container_data_root"] == container_root
+
+    calls = _mock_subprocess_run(monkeypatch)
+
+    terminal_tool._create_environment(
+        env_type=config["env_type"],
+        image=config["docker_image"],
+        cwd=config["cwd"],
+        timeout=config["timeout"],
+        container_config={
+            "container_persistent": True,
+            "docker_mount_cwd_to_workspace": config["docker_mount_cwd_to_workspace"],
+        },
+        task_id="dood-e2e",
+        host_cwd=config["host_cwd"],
+        container_data_root=config["container_data_root"],
+    )
+
+    run_calls = [c for c in calls if isinstance(c[0], list) and len(c[0]) >= 2 and c[0][1] == "run"]
+    assert run_calls, "docker run should have been called"
+    run_args_str = " ".join(run_calls[0][0])
+    assert f"{host_root}:/workspace" in run_args_str
+    assert f"{host_root}/sandboxes/docker/dood-e2e/home:/root" in run_args_str
+    assert f"{host_root}/google_token.json:/root/.hermes/google_token.json:ro" in run_args_str
+    assert f"{host_root}/skills:/root/.hermes/skills:ro" in run_args_str
+    assert f"{host_root}/cache/screenshots:/root/.hermes/cache/screenshots:ro" in run_args_str
+    assert f"{container_root}/sandboxes/docker/dood-e2e/home:/root" not in run_args_str
+
+
+def test_host_data_root_rewrites_mounts_without_cwd_passthrough(monkeypatch, tmp_path):
+    """TERMINAL_DOCKER_HOST_DATA_ROOT must rewrite mounts even with
+    TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE off — the two are separate
+    concerns and previously shared one gate, silently no-opping the rewrite.
+    """
+    container_root, credential_path, skills_path, cache_path = _patch_dood_mounts(monkeypatch, tmp_path)
+    host_root = "/mnt/user/appdata/hermes-agent/opt/data"
+
+    import tools.credential_files as credential_files
+    monkeypatch.setattr(credential_files, "get_skills_directory_mount", lambda container_base="/root/.hermes": [])
+    monkeypatch.setattr(credential_files, "get_cache_directory_mounts", lambda container_base="/root/.hermes": [])
+
+    monkeypatch.setenv("TERMINAL_ENV", "docker")
+    monkeypatch.setenv("TERMINAL_CWD", container_root)
+    monkeypatch.delenv("TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE", raising=False)
+    monkeypatch.setenv("TERMINAL_DOCKER_HOST_DATA_ROOT", host_root)
+    monkeypatch.setenv("TERMINAL_CONTAINER_PERSISTENT", "true")
+
+    config = terminal_tool._get_env_config()
+    assert config["docker_mount_cwd_to_workspace"] is False
+    assert config["cwd"] == container_root
+    assert config["host_cwd"] == host_root
+    assert config["container_data_root"] == container_root
+
+    calls = _mock_subprocess_run(monkeypatch)
+
+    terminal_tool._create_environment(
+        env_type=config["env_type"],
+        image=config["docker_image"],
+        cwd=config["cwd"],
+        timeout=config["timeout"],
+        container_config={
+            "container_persistent": True,
+            "docker_mount_cwd_to_workspace": config["docker_mount_cwd_to_workspace"],
+        },
+        task_id="dood-no-passthrough",
+        host_cwd=config["host_cwd"],
+        container_data_root=config["container_data_root"],
+    )
+
+    run_calls = [c for c in calls if isinstance(c[0], list) and len(c[0]) >= 2 and c[0][1] == "run"]
+    assert run_calls, "docker run should have been called"
+    run_args_str = " ".join(run_calls[0][0])
+    assert f"{host_root}/sandboxes/docker/dood-no-passthrough/home:/root" in run_args_str
+    assert f"{host_root}/google_token.json:/root/.hermes/google_token.json:ro" in run_args_str
+    assert f"{container_root}/sandboxes/docker/dood-no-passthrough/home:/root" not in run_args_str
+
+
+def test_rewrite_mount_source_preserves_foreign_windows_host_root():
+    """Regression: abspath() treated a Windows drive path like E:\\ai-infra\\data
+    as relative and mangled it against this process's cwd, breaking every
+    mount on a Windows Docker Desktop host.
+    """
+    result = docker_env._rewrite_mount_source_for_docker_host(
+        "/opt/data/skills",
+        container_root="/opt/data",
+        host_root="E:\\ai-infra\\data",
+    )
+    assert result == docker_env.os.path.join("E:\\ai-infra\\data", "skills")
+    assert not result.startswith("/opt/data")
 
 
 def test_non_persistent_cleanup_removes_container(monkeypatch):

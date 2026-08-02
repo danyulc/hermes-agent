@@ -1484,16 +1484,32 @@ def _get_env_config() -> Dict[str, Any]:
     if cwd and not _is_ssh_remote_tilde_cwd(env_type, cwd):
         cwd = os.path.expanduser(cwd)
     host_cwd = None
-    if env_type == "docker" and mount_docker_cwd:
+    container_data_root = None
+    cwd_remapped_to_workspace = False
+    if env_type == "docker":
         docker_cwd_source = os.getenv("TERMINAL_CWD") or _safe_getcwd()
         candidate = os.path.abspath(os.path.expanduser(docker_cwd_source))
-        if (
+        # DooD: candidate is container-visible, not host-visible. Independent
+        # of mount_docker_cwd — home/credential/skills/cache mounts need
+        # rewriting even when cwd-to-workspace passthrough is off.
+        explicit_host_data_root = os.getenv("TERMINAL_DOCKER_HOST_DATA_ROOT", "").strip()
+        if explicit_host_data_root:
+            # Not expanduser'd: Docker-daemon-side path, possibly foreign OS syntax.
+            host_cwd = explicit_host_data_root
+            container_data_root = candidate
+            if mount_docker_cwd:
+                cwd = "/workspace"
+                cwd_remapped_to_workspace = True
+        elif mount_docker_cwd and (
             any(candidate.startswith(p) for p in _HOST_CWD_PREFIXES)
             or (os.path.isabs(candidate) and os.path.isdir(candidate) and not candidate.startswith(("/workspace", "/root")))
         ):
             host_cwd = candidate
+            container_data_root = candidate
             cwd = "/workspace"
-    elif env_type in _CONTAINER_BACKENDS and cwd:
+            cwd_remapped_to_workspace = True
+
+    if env_type in _CONTAINER_BACKENDS and cwd and not cwd_remapped_to_workspace:
         # Host paths and relative paths that won't work inside containers
         if _is_unusable_container_cwd(cwd) and cwd != default_cwd:
             logger.info("Ignoring TERMINAL_CWD=%r for %s backend "
@@ -1512,6 +1528,7 @@ def _get_env_config() -> Dict[str, Any]:
         "vercel_runtime": os.getenv("TERMINAL_VERCEL_RUNTIME", "").strip(),
         "cwd": cwd,
         "host_cwd": host_cwd,
+        "container_data_root": container_data_root,
         "docker_mount_cwd_to_workspace": mount_docker_cwd,
         "timeout": _parse_env_var("TERMINAL_TIMEOUT", "180"),
         "lifetime_seconds": _parse_env_var("TERMINAL_LIFETIME_SECONDS", "300"),
@@ -1572,10 +1589,11 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
                         ssh_config: dict = None, container_config: dict = None,
                         local_config: dict = None,
                         task_id: str = "default",
-                        host_cwd: str = None):
+                        host_cwd: str = None,
+                        container_data_root: str = None):
     """
     Create an execution environment for sandboxed command execution.
-    
+
     Args:
         env_type: One of "local", "docker", "singularity", "modal",
             "daytona", "vercel_sandbox", "ssh"
@@ -1586,7 +1604,8 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
         container_config: Resource config for container backends (cpu, memory, disk, persistent)
         task_id: Task identifier for environment reuse and snapshot keying
         host_cwd: Optional host working directory to bind into Docker when explicitly enabled
-        
+        container_data_root: Container-visible root for mount rewriting. Falls back to cwd.
+
     Returns:
         Environment instance with execute() method
     """
@@ -1618,6 +1637,7 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
             persistent_filesystem=persistent, task_id=task_id,
             volumes=volumes,
             host_cwd=host_cwd,
+            container_root=container_data_root,
             auto_mount_cwd=cc.get("docker_mount_cwd_to_workspace", False),
             forward_env=docker_forward_env,
             env=docker_env,
@@ -2436,6 +2456,7 @@ def terminal_tool(
                             local_config=local_config,
                             task_id=effective_task_id,
                             host_cwd=config.get("host_cwd"),
+                            container_data_root=config.get("container_data_root"),
                         )
                     except ImportError as e:
                         return json.dumps({
